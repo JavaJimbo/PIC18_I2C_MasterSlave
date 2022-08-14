@@ -1,0 +1,816 @@
+/*      NASA SENSOR MODBUS for Roscid Technologies.
+ *      VERSION V7.0
+ *      For PIC18LF26K80 - Compiler XC8 V1.33 MPLABX IDE V5.15
+ *
+ *      11-21-18 Warwick: Got basic AD conversion working. 
+ *      Nice response time, 10 bit AD, 500 uS pulse width.
+    * 
+ *      11-23-18 NY: Added MCP3221 routines for 12 bit AD converter.
+ *      Operating modes: STANDBY, CALIBRATE, RUN
+ *      11-25-18:
+ *      12-3-18: Warwick: started command interpreter, got EEPROM working
+ *      12-4-18: Roscid: hard coded RH calibration, created interpolation routine.
+ *      12-8-18: Warwick: 
+ *      12-10-18: Woburn:
+ *      12-13-18: Testing in chamber. Problem noted with decimal point display.
+ *      12-13-18: Fixed bug storing cal data in EEPROM
+ *      12-17-18: Warwick: added new features: CreateDecimalString(), PER and FIL commands
+ *      12-17-18: Set MAX_PERIOD to 30
+ *      12-19-18: 
+ *      12-21-18: Added EEPROM map MAX period = 60
+ *      12-26-18: Change all registers to two byte integers
+ *  	12-28-18  Woburn: Up to date version with tested Modbus communication
+ *                  Two way Modbus communication working.
+ *      12-30-18: Warwick: worked on Modbus reading routines.
+ *      12-31-18: Woburn: got ReadInputRegisters() and ReadWriteMultipleRegisters() working.
+ *                  Integers are sent/received in Modbus packets MSB first, 
+ *                  but they are stored in EEPROM LSB first.
+ *      01-01-19: Warwick: minor correction to above read/write routine.
+ *                  MODBUS_TIMEOUT_MILLISECONDS = 2
+ *      01-02-19: 
+ *      01-03-19: Woburn: Got ReadInputRegisters() working with VC++ and four sensors on bus.
+ *      01-04-19: Woburn: Disabled eeprom writes for addresses < 128
+ *                  Added input VERSION_NUMBER_ADDRESS 0,
+ *                  Also minor bug fixes for input addresses.
+ * 
+ *      01-09-19: Woburn: Prepared V1.0 for release to first customer
+ *                  Tested and developed in tandem with VC++ program Roscid Modbus Master V1.0
+ *                  Compiled with Microchip XC8 V1.33 compiler. Max sensors ID fixed at 64.
+ *                  Calibration disabled for this version.
+ *      02-04-19: Warwick: converted to integer math.
+ *      02-05-19: Woburn: Added CalibrateRHsetpoint() function - works for slave ID #0 
+ *                  for calibrating multiple sensors simultaneously.
+ *                  Shipped to 16 units.
+ *      02-07-19: Charlton: 
+ *      02-10-19: Warwick: no big changes - tested with V2.0 of VC++ Roscid Modbus V2.0
+ *      01-13-19: Warwick: fixed bug causing RH to be multiplied times 10.
+ *      02-14-19: Woburn: Version 1.3: programmed with individual Slave IDs.
+ *      02-27-19: Woburn: programmed with individual Slave IDs and fixed pulse periods of 20 2n4 40
+ *                    No additional code changes. Version number appears to 5.2 Not sure how it got set to that value.
+ *                    FIXED DEFAULT SLAVE ID VERSION
+ *      05-08-19: Woburn: No changes to V5.2
+ *      05-10-19: Added ADC for temperature measurement. Also read pulse period and slave ID from EEprom.
+ *                EEPROM_FLAG_ADDRESS is set to 0x1234;
+ *      05-12-19 Warwick: Fixed bugs so temperature is being properly read in Celsius and Fahrenheit
+ *      05-17-19 Woburn: RELEASE VERSION 6.1: Fixed bug creating RH errors due to extraneous pulses - added skipPulseFlag = true
+ *              after temp calculations and also Modbus communications.
+ *
+ *      05-19-19 Warwick: RELEASE VERSION 6.2: Upgraded code to use EEPROM sensor ID and debugged. Also tested reading version number.
+ *      09-12-19 Warwick: VERSION 6.3: Clamp RH to 0, so it can't go negative.
+ *      05-08-20 Warwick: VERSION 7.0: Switched to PIC18LF26K80. Removed all code for MCP3221 AD converter.
+ *                  Added new routines for using internal 12 bit AD converter
+ *      05-10-20 Warwick: 
+ *      05-28-20 Warwick: 
+ *      05-29-20 Warwick: Got a nice 500 Hz sinewave working with magic sinewaves.
+ *      05-30-20 Warwick: Measuring RH. Added averaging.
+ *      05-31-20 Warwick: Added temperature measurement. Using 2048 for center AD offset.
+ *      06-04-20 Warwick: New pin assignments for Rev 4 board. All outputs and inputs work, but RS485 communication not tested yet.
+ *                          Uses AD channel 4 (RA5) for RH and AD channel 8 (RB1) for thermistor.
+ *                          SINE_OUT (PWM) is RC0, TEST_OUT is RB3, LED_OUT is RA1, RS485_TX_ENABLE is RC1
+ *                          RELEASE VERSION 8.0 Uploaded to Egnyte. 12 bit AD tested. PWM / Magic Sinewave generation works. Modbus NOT tested yet.
+ *                      
+ */
+#include "Project.h"
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <ctype.h>
+#include "DELAY.h"
+#include <xc.h>
+
+#define START_TIME 200
+#define STOP_TIME 100
+
+// DEFAULT PIC EEPROM TABLE
+// The 512 bytes of EEPROM should be factory programmed
+// with these values. To make sure this happens,
+// right click on project name "Nasa Sensor Modbus,"
+// click on "Properties" at bottom, then on the left side
+// in the "Categories" click on "ICD 3", and make sure
+// "Preserve EEPROM memory" is NOT checked.
+// If you wish to reprogram the PIC and preserve the
+// EEPROM, then the Preserve box should be checked,
+// and the "Preserve EEPROM Range" below it should be set to 0-3FF
+// to avoid overwriting any part of the 512 EEPROM bytes.
+// Also, comment out this table to ensure it doesn't get used.
+
+
+// 0
+__EEPROM_DATA(0xFF,0x00,0x06,0x00,0x10,0x00,0x14,0x00); 
+__EEPROM_DATA(0xFF,0x0F,0xFF,0x0F,0xE1,0x02,0x88,0x13); // Calibration data begins at EEPROM address 12, set here to 0xE1
+__EEPROM_DATA(0x7E,0x03,0x70,0x17,0x4C,0x04,0x58,0x1B);
+__EEPROM_DATA(0x28,0x05,0x40,0x1F,0xBB,0x05,0xD0,0x20); 
+// 32
+__EEPROM_DATA(0xD6,0x06,0x60,0x22,0x00,0x00,0x00,0x00); 
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+// 64
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00); 
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+// 96
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+// 128
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+// 160
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+// 192
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+// 224
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+// 256
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+// 288
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+// 320
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+// 352
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+// 384
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+// 416
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+// 448
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+// 480
+__EEPROM_DATA(0x34,0x12,0x00,0x00,0x00,0x00,0x00,0x00); 
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+__EEPROM_DATA(0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+// 512 bytes total internal EEPROM in PIC
+ 
+extern unsigned short TestTempCounts;
+unsigned char ADchannel = RH_AD_CHANNEL;
+unsigned short RH_ADSampled;
+unsigned short filterSize = DEFAULT_RH_FILTERSIZE;
+unsigned short RH_SampledArea = 0;
+long SampledArea = 0;
+// long PositiveHalfCycleADCounts = 0, NegativeHalfCycleADCounts = 0;
+long RHmeasured = 0;
+short CorrectedTempCelsius_x10 = 0;
+long TempCelsius_x100 = 0;
+short TempCelsius_x10 = 0;
+long CorrectedTempCelsius_x100 = 0;
+short CorrectedTempFahrenheit_x10 = 0;
+long DewpointMeasured = 0;
+short  RS485_Timeout = 0;
+unsigned short ModbusTxLength = 0;
+unsigned short ModbusRxLength = 0;
+unsigned char ModbusRxBuffer[MAX_MODBUS_SIZE];
+unsigned char ModbusTxBuffer[MAX_MODBUS_SIZE];
+unsigned short arrTempADCounts[MAX_TEMP_SAMPLES];
+unsigned short arrRHADCounts[MAX_RH_SAMPLES];
+unsigned short NumberOfRHSamples = 0;
+extern unsigned char ADstatus;
+
+short ReadEEpromRegister(unsigned short address);
+short MeasuredOffsetTemperature, ReferenceOffsetTemperature, MeasuredGainTemperature, ReferenceGainTemperature;
+extern unsigned short processModbus(unsigned char *ptrRxModbus, unsigned char *ptrTxModbus);
+extern unsigned short SetSlaveID(unsigned char *ptrRxModbus, unsigned char *ptrTxModbus);
+extern unsigned short CalibrateTemperatureOffset(unsigned char *ptrRxModbus, unsigned char *ptrTxModbus);
+extern unsigned short CalibrateTemperatureGain(unsigned char *ptrRxModbus, unsigned char *ptrTxModbus);
+long CalculateCorrectedTemperatureCelsius(long CurrentMeasuredTemperature, short MeasuredOffsetTemperature, short ReferenceOffsetTemperature, short MeasuredGainTemperature, short ReferenceGainTemperature);
+
+unsigned short CalculateRH_X10(short numSetpoints, short ADcounts, TableType *ptrTable);
+// long ConvertResistanceToADCounts(unsigned short Rth);
+long CalculateTempCelsiusX100(unsigned short numSetpoints, unsigned short ADcounts, unsigned short *ptrADCounts);
+long ConvertCelsiusToFahrenheit_x100(long TemperatureCelsius_x100);
+void WriteDefaultsToEEprom();
+unsigned short ADconvertAndRead(unsigned char channel);
+extern void InitializeHardware(void);
+void loadCalibrationTable();
+void CalculateTemperature();
+extern unsigned char CheckCRC (unsigned char *ptrRxModbus, short RxModbusLength);
+
+void StartADconversion(unsigned char channel);
+unsigned short GetADconversion();
+
+TableType arrRHCalTable[MAX_RH_SETPOINTS]; 
+
+
+//
+// 27640, 26460, 25330, 24260, 23240, 22270, 21350, 20470, 19630, 18830, 
+// 18060, 17340, 16640, 15980, 15350, 14740, 14170, 13620, 13090, 12590, 
+// 12110, 11650, 11210, 10790, 10380, 10000, 9632, 9279, 8942, 8619,
+// 8309, 8102, 7727, 7454, 7192, 6941, 6700, 6468, 6246, 6033,
+// 5828, 5631, 5441, 5259, 5084, 4916, 4754, 4598, 4448, 4304 
+
+
+// The table below is based on thermistor resistance values  
+// in the ERTJ1VG103JA R-T Characteristics datasheet.
+// Digikey part number: #P12014CT-ND, Mfg part number: ERT-J1VG103JA:
+//
+// This table is comprised of 10 bit A to D converter (ADC) counts 
+// calculated from that resistance table. They are derived as follows:
+//
+// A voltage divider is formed with a 10k resistor to 3.3V and the thermistor to ground. 
+// The ADC input is connected to the middle of the divider.
+// So at 25C, the ADC sees half the supply voltage, and
+// the ten bit AD counts would be 1024/2 = 512 counts.
+//
+// So the relationship between AD counts and thermistor resistance Rth is:
+// (3.3V * Rth)/(10000 + Rth) = (ADcounts/1024) * 3.3V
+//
+// From this we derive: ADcounts = (Rth * 1024) / (10000 + Rth)
+// As a quick check: at 25C, Rth = 10k, so ADcounts = 512
+//
+// The table below was generated using this formula.
+// The first value is AD counts at 0 degrees C, the last is 49 degrees C.
+// This makes it absurdly simple to translate AD counts to temperature,
+// since the array index is exactly the temperature in Celsius!
+unsigned short arrCelsiusADCounts[TEMP_CELSIUS_TABLE_SIZE] = {
+751, 743, 734, 725, 715, 706, 697, 687, 678, 668,  // 0-9 degrees C
+659, 649, 639, 629, 620, 610, 600, 590, 580, 570,  // 10-19 degrees C
+560, 551, 541, 531, 521, 512, 502, 492, 483, 474,  // 20-29 degrees C
+464, 458, 446, 437, 428, 419, 410, 402, 393, 385,  // 30-39 degrees C
+377, 368, 360, 352, 345, 337, 329, 322, 315, 308 }; // 40-49 degrees C
+
+
+
+unsigned short SineFrequency = 1000;
+
+/*
+enum 
+{
+    STANDBY = 0,
+    RUN,
+    CALIBRATE
+};
+*/
+
+// Watchdog enabled for 2.1 second timeout: 1/(31,250 Hz/128/512) = 2.1 seconds approx, so WDTPS = 512 BORV = 1 for 2.7V brownout, FOSC = INTIO2 for internal RC oscillator $$$$
+// PLLCFG = ON, 
+#pragma config SOSCSEL = DIG, PLLCFG = ON, FOSC = INTIO2, IESO = OFF, FCMEN = OFF, BOREN = ON, BORV = 1, PWRTEN = ON, WDTEN = OFF, WDTPS = 512, MCLRE = 1, STVREN = ON, XINST = OFF, CP0 = OFF, CP1 = OFF, CP2 = OFF, CP3 = OFF, CPB = OFF, CPD = OFF
+
+extern void putch2(unsigned char ch);
+extern void putch(unsigned char ch);
+short displayCounter = 0;
+short numberOfSetpoints = 6;
+short PulsePeriod = DEFAULT_PERIOD;
+unsigned char DeviceID = 255, commandDevice = 0;
+double RHpercent;
+
+
+#define SYSTEM_CLOCK 64000000
+
+long QuadSineTable[15] = 
+{
+  517, // p1 predelay 
+  59,  // p1 width 
+  25,  // p2 predelay 
+  80, //  p2 width 
+  384, //  p3 predelay 
+  268, //  p3 width 
+  271, // p4 predelay 
+  384, //  p4 width 
+  163, //  p5 predelay 
+  477, //  p5 width 
+  79,  // p6 predelay 
+  536, //  p6 width 
+  25,  // p7 predelay 
+  732, //  p7 width 
+  2, // postdelay 
+};
+long TimerReload[28];
+
+void main()
+{            
+    short i;       
+    float ReloadValue;
+    long RH_AD_CountsSum = 0;
+    long RH_AD_Offset = 0;
+    long SampleCounts = 0, SumSampleCounts = 0, AverageCounts = 0;
+    // unsigned short TestCounter = 0;
+    long longArea;
+    unsigned short arrRH_ADReadings[128];
+    short ADIndex = 0;        
+    short DisplayCounter = 0;
+    long lngRH_ADSampled;    
+    long SumArea = 0;
+       
+    InitializeHardware(); // Now initialize hardware I/O - port pins, interrupts, timers, UARTs etc.  
+    
+    DelayMs(200);
+    
+    T1CONbits.TMR1ON = 0;   // Timer OFF    
+    
+    // printf("\r\rCheck sine table:");
+    for (i = 0; i <= 15; i++) TimerReload[i] = 0x10000 - ((QuadSineTable[i] * 1742) / 1000); //  For 500 Hz
+    
+    /*
+    for (i = 0; i <= 14; i++)
+    {
+        ReloadValue = (float)TimerReload[i];
+        printf("\r#%d: %0.0f", i, ReloadValue);
+    }
+    */
+    
+    for (i = 0; i < 128; i++) arrRH_ADReadings[i] = 0x0000;
+    
+    T1CONbits.TMR1ON = 1;   // Timer ON            
+
+    RS485_TX_ENABLE = 0;
+    DelayMs(100);
+        
+    WriteDefaultsToEEprom();        
+    loadCalibrationTable();        
+
+    // MAIN PROGRAM LOOP:
+    while (FOREVER) 
+    {
+        ClrWdt(); // CLEAR_WATCHDOG        
+        if (ModbusRxLength)
+        {
+            if (0 != CheckCRC (ModbusRxBuffer, ModbusRxLength))
+            {
+                if (ModbusRxBuffer[0] == DeviceID || ModbusRxBuffer[0] == 0 || ModbusRxBuffer[0] == 0xFF)
+                {
+                    ModbusTxLength = processModbus(ModbusRxBuffer, ModbusTxBuffer);
+                    if (ModbusRxBuffer[0] != 0x00)
+                    {
+                        if (ModbusTxLength)
+                        {
+                            RS485_TX_ENABLE = 1;
+                            DelayMs(10);
+                            for (i = 0; i < ModbusTxLength; i++)
+                            putchar(ModbusTxBuffer[i]);
+                        }
+                        DelayMs(10);                            
+                    }
+                    RS485_TX_ENABLE = 0;
+                }
+            }        
+            ModbusTxLength = 0;
+            ModbusRxLength = 0;            
+        }
+       
+        if (ADstatus == AD_TEMP_DATA_READY)
+        {
+            CalculateTemperature();
+            ADstatus = AD_STANDBY;
+        }
+        
+        if (ADstatus == AD_RH_DATA_READY)
+        {            
+            RH_AD_CountsSum = 0;
+            // Calculate the average of all the RH samples taken over a complete sine wave cycle.
+            // This will be used as the center line or zero offset for the sine wave.
+            // We want to calculate the total area of the two sine wave half cycles.
+            SampledArea = 0;
+            SumSampleCounts = 0;
+            for (i = 0; i < NumberOfRHSamples; i++)
+            {
+                SampleCounts = (long) arrRHADCounts[i];
+                SumSampleCounts = SumSampleCounts + SampleCounts;
+                SampledArea = SampledArea + abs(SampleCounts - 2048);
+            }             
+            AverageCounts = SumSampleCounts / (long)NumberOfRHSamples;
+            if (SampledArea > 0xFFFF) SampledArea = 0xFFFF;
+            
+            if (ADIndex > 127) ADIndex = 0;
+            arrRH_ADReadings[ADIndex++] = (unsigned short)SampledArea;
+            
+            SumArea = 0;
+            for (i = 0; i < 128; i++) SumArea = SumArea + (long)arrRH_ADReadings[i];
+            lngRH_ADSampled = SumArea / 128;
+            if (lngRH_ADSampled > 0xFFFF) lngRH_ADSampled = 0xFFFF;
+            RH_ADSampled = (unsigned short) lngRH_ADSampled;            
+            RHmeasured = (long)(CalculateRH_X10(numberOfSetpoints , RH_ADSampled, arrRHCalTable));
+            ADstatus = AD_MEASURE_TEMPERATURE;                            
+        }
+        DelayMs(1);        
+        /*
+        DisplayCounter++;
+        if (DisplayCounter > 25)
+        {
+            DisplayCounter = 0;            
+            if (TestCounter > 0x7FFF) TestCounter = 0;     
+            if (RS485_TX_ENABLE) RS485_TX_ENABLE = 0;
+            else RS485_TX_ENABLE = 1;
+            if (TEST_OUT) TEST_OUT = 0;
+            else TEST_OUT = 1;
+            if (LED_OUT) LED_OUT = 0;
+            else LED_OUT = 1;
+            printf("\r#%d: T: %u, Offset (average): %lu, SampleArea: %lu, Average: %u", TestCounter++, TestTempCounts, AverageCounts, SampledArea, RH_ADSampled);
+        }        
+        */
+    }
+}
+
+
+void CalculateTemperature()
+{
+    unsigned short ADCounts;
+    unsigned long SumTempADCounts, AverageADcounts;        
+    short i;
+    
+    SumTempADCounts = 0;
+    for (i = 0; i < DEFAULT_RH_FILTERSIZE; i++)
+        SumTempADCounts = SumTempADCounts + arrTempADCounts[i];
+    AverageADcounts = SumTempADCounts / DEFAULT_RH_FILTERSIZE;
+    ADCounts =(unsigned short) AverageADcounts;
+    TempCelsius_x100 = CalculateTempCelsiusX100(TEMP_CELSIUS_TABLE_SIZE, ADCounts, arrCelsiusADCounts);
+    TempCelsius_x10 = TempCelsius_x100 / 10;
+    CorrectedTempCelsius_x100 = CalculateCorrectedTemperatureCelsius(TempCelsius_x100, MeasuredOffsetTemperature, ReferenceOffsetTemperature, MeasuredGainTemperature, ReferenceGainTemperature);
+    CorrectedTempFahrenheit_x10 = ConvertCelsiusToFahrenheit_x100(CorrectedTempCelsius_x100) / 10;
+    CorrectedTempCelsius_x10 = CorrectedTempCelsius_x100 / 10;
+}
+
+
+// CalculateTempCelsiusX100( )
+// Returns the Temperature in degrees Celsius as an integer multiplied times 100
+//
+// Since our desired temperature range begins at 0 degrees Celsius,
+// and all the temperatures in the table are at increments of one degree Celsius,
+// then the table lists temperatures as 0,1,2,3,4,5,6,7 ... 49 degrees Celsius.
+// These values just happen to be the same as the array index for our table.
+// So instead of implementing a resistance / temperature table consisting of a pair 
+// of arrays - one resistance and the other temperature, we can get away with
+// a single array of resistances. Since the thermistor resistance is being
+// measured as AD counts, the resistances were converted to AD counts
+// to create the arrCelsiusADCounts[] array at the top of the page.
+// See accompanying explanation for those calculations.
+//
+// The formula for converting measured AD counts to temperature Celsius is T = mx + b
+// The slope m is: (TC2 - TC1) / (AD2 - AD1) where TC1,TC2 are temperatures and AD1, AD2  
+// are AD counts derived from the resistance values in the thermistor datasheet table.
+// 
+// T = ((ADC - AD1) * ((TC2 - TC1) / (AD2 - AD1))) + TC1  where ADC is the measured AD counts.
+// Since the difference between any two contiguous temperature values in the datasheet table
+// is always one degree Celsius, and we wish to use integer math for calculations,
+// we can substitute -100 for (TC2 - TC1). This multiplies values by 100 
+// to avoid losing fractional values when dividing. The numerator is negative
+// because the thermistor is a NTC type so the resistance (and the AD counts)
+// are inversely proportional to temperature. 
+//
+long CalculateTempCelsiusX100(unsigned short numSetpoints, unsigned short ADcounts, unsigned short *ptrADC_Table)
+{    
+    unsigned short i;
+    long AD1, AD2;
+    long TC1, slopeNumerator, slopeDenominator, TempCelsiusX100;
+    
+    // Example: measured AD counts = 514
+    for (i = 0; i < numSetpoints; i++)
+    {
+        if (ADcounts >= ptrADC_Table[i]) break;  // ptrADCounts[25] = 512
+    }
+    if (i >= numSetpoints) i = numSetpoints - 1;
+    
+    if (ADcounts == ptrADC_Table[i]) return (i * 100);
+    if (i == 0) return 0;
+    
+    TC1 = i * 100;  // 2500
+    AD1 = (long)ptrADC_Table[i];    // 512
+    AD2 = (long)ptrADC_Table[i-1];  // 521
+        
+    slopeNumerator = -100;         
+    slopeDenominator = AD2 - AD1;   // 521-512 = 9
+    
+                     //   (514 - 512)  *          (-100 / 9)                 + 2500  = 2477  Temp Celsius X 100
+    TempCelsiusX100 = ((ADcounts - AD1)*(slopeNumerator / slopeDenominator)) + TC1;   
+    return TempCelsiusX100; // Temp Celsius X 100 = 2480 C
+}
+
+
+long ConvertCelsiusToFahrenheit_x100(long TemperatureCelsius_x100)
+{
+    long TempFahrenheit_x100;
+       
+    TempFahrenheit_x100 = ((TemperatureCelsius_x100 * 9) / 5) + 3200;
+    
+    return TempFahrenheit_x100;
+}
+
+void WriteDefaultsToEEprom()
+{
+unsigned short checkFlagRegister;
+ConvertType convert;
+    
+    convert.b[0] = eeprom_read (EEPROM_FLAG_ADDRESS+0);
+    convert.b[1] = eeprom_read (EEPROM_FLAG_ADDRESS+1);
+    checkFlagRegister = convert.integer;
+    
+    if (checkFlagRegister != 0x9999)
+    {
+        eeprom_write(EEPROM_FLAG_ADDRESS+0, 0x99); // LSB
+        eeprom_write(EEPROM_FLAG_ADDRESS+1, 0x99); // MSB
+        
+        eeprom_write(SLAVE_ID_EEPROM_ADDRESS, DEFAULT_DEVICE_ID);
+        eeprom_write(SLAVE_ID_EEPROM_ADDRESS+1, 0x00);
+        
+        
+        eeprom_write(FILTER_SIZE_EEPROM_ADDRESS, DEFAULT_RH_FILTERSIZE);
+        eeprom_write(FILTER_SIZE_EEPROM_ADDRESS+1, 0x00);
+        
+        eeprom_write(PULSE_PERIOD_EEPROM_ADDRESS, DEFAULT_PERIOD);
+        eeprom_write(PULSE_PERIOD_EEPROM_ADDRESS+1, 0x00);
+        
+        eeprom_write(REFERENCE_OFFSET_TEMPERATURE_ADDRESS, 0xFF);
+        eeprom_write(REFERENCE_OFFSET_TEMPERATURE_ADDRESS+1, 0x0F);
+        eeprom_write(REFERENCE_GAIN_TEMPERATURE_ADDRESS, 0xFF);
+        eeprom_write(REFERENCE_GAIN_TEMPERATURE_ADDRESS+1, 0x0F);
+       
+    }
+}
+
+// This routine adds offset and gain correction to the Current input temperature.
+// The Measured and Reference input temperatures are stored in EEPROM at calibration time.
+// The input Current temperature is assumed to be Celsius times 100.
+// The returned corrected temperature is Celsius times 100.
+long CalculateCorrectedTemperatureCelsius(long CurrentMeasuredTemperature, short MeasuredOffsetTemperature, short ReferenceOffsetTemperature, short MeasuredGainTemperature, short ReferenceGainTemperature)
+{        
+    long lngMeasuredOffsetTemperature, lngReferenceOffsetTemperature, lngMeasuredGainTemperature, lngReferenceGainTemperature;
+    long numerator, denominator, offsetError, CorrectedTemperature;
+    
+    // These calibration temperatures from EEPROM are multiplied 
+    lngMeasuredOffsetTemperature = (long) MeasuredOffsetTemperature * 10;
+    lngReferenceOffsetTemperature = (long) ReferenceOffsetTemperature * 10;
+    lngMeasuredGainTemperature = (long) MeasuredGainTemperature * 10;
+    lngReferenceGainTemperature = (long) ReferenceGainTemperature * 10;
+    
+    if (ReferenceOffsetTemperature >= 999)
+        return CurrentMeasuredTemperature;
+    
+    // We can't divide by zero, so if offset and gain 
+    // temperatures are the same (they normally wouldn't be),
+    // then just add the offset to the measured temperature and quit:    
+    if (lngMeasuredOffsetTemperature == lngMeasuredGainTemperature || ReferenceGainTemperature >= 999)        
+    {
+        offsetError = lngMeasuredOffsetTemperature - lngReferenceOffsetTemperature;
+        CorrectedTemperature = CurrentMeasuredTemperature - offsetError;
+        return CorrectedTemperature;
+    }
+    
+    // #define MULTIPLIER 256
+    numerator = (lngReferenceOffsetTemperature - lngReferenceGainTemperature); // * MULTIPLIER;
+    denominator = lngMeasuredOffsetTemperature - lngMeasuredGainTemperature;
+    
+    // Equation for temperature with offset and gain correction: y = mx + b
+    // y = corrected temperature
+    // x = (Current measured Temp - Offset temp measured) * slope + reference offset temperature
+    // m = slope = (numerator/denominator) = (RefOffsetTemp - RefGainTemp) / (MeasuredOffsetTemp - MeasuredGainTemp) 
+    CorrectedTemperature = (((CurrentMeasuredTemperature - lngMeasuredOffsetTemperature) * numerator) / denominator) + (lngReferenceOffsetTemperature);
+    // CorrectedTemperature = CorrectedTemperature / MULTIPLIER;
+
+    return CorrectedTemperature;
+}
+
+short ReadEEpromRegister(unsigned short address)
+{
+    short RegisterValue;
+    ConvertType convert;        
+    convert.b[0] = eeprom_read (address+0);
+    convert.b[1] = eeprom_read (address+1);
+    RegisterValue = (short)convert.integer;
+    return(RegisterValue);
+}
+
+void loadCalibrationTable()
+{
+unsigned short i, address;
+ConvertType convert;
+
+    // while(WR) continue;
+
+    DeviceID = eeprom_read (SLAVE_ID_EEPROM_ADDRESS); // $$$$
+    
+    numberOfSetpoints = ReadEEpromRegister(NUMBER_OF_SETPOINTS_EEPROM_ADDRESS);
+    if (numberOfSetpoints > MAX_RH_SETPOINTS) numberOfSetpoints = MAX_RH_SETPOINTS;
+    
+    filterSize = ReadEEpromRegister(FILTER_SIZE_EEPROM_ADDRESS);    
+    if (filterSize > MAX_FILTERSIZE) filterSize = MAX_FILTERSIZE;
+    
+    PulsePeriod = ReadEEpromRegister(PULSE_PERIOD_EEPROM_ADDRESS); // $$$$
+    if (PulsePeriod > MAX_PERIOD) PulsePeriod = MAX_PERIOD;
+    
+    MeasuredOffsetTemperature = ReadEEpromRegister(MEASURED_OFFSET_TEMPERATURE_ADDRESS);
+    ReferenceOffsetTemperature = ReadEEpromRegister(REFERENCE_OFFSET_TEMPERATURE_ADDRESS);
+    MeasuredGainTemperature = ReadEEpromRegister(MEASURED_GAIN_TEMPERATURE_ADDRESS);
+    ReferenceGainTemperature = ReadEEpromRegister(REFERENCE_GAIN_TEMPERATURE_ADDRESS);
+    
+    /*
+    RS485_TX_ENABLE = 1;
+    DelayMs(200);
+    printf("\r>Setpoints: %d, Samples: %d, PP: %d, Measured Off: %d, Ref Off: %d", numberOfSetpoints, numberOfSamples, PulsePeriod, MeasuredOffsetTemperature, ReferenceOffsetTemperature);
+    DelayMs(200);
+    RS485_TX_ENABLE = 0;
+    */
+    
+    printf("\rNum Setpoints: %d, Samples: %d, PP: %d", numberOfSetpoints, filterSize, PulsePeriod, MeasuredOffsetTemperature, ReferenceOffsetTemperature);    
+    printf("\r\rCAL TABLE:");
+    
+    if (numberOfSetpoints < MAX_RH_SETPOINTS)
+    {
+        
+        for (i = 0; i < numberOfSetpoints; i++)
+        {   
+            address = (i*4) + CAL_START_EEPROM_ADDRESS;
+            convert.b[0] = eeprom_read (address+0);
+            convert.b[1] = eeprom_read (address+1);
+            arrRHCalTable[i].ADcounts = convert.integer;
+        
+            convert.b[0] = eeprom_read (address+2);
+            convert.b[1] = eeprom_read (address+3);        
+            arrRHCalTable[i].RHpercent = convert.integer;
+            
+            printf("\rAD: %d => RHx10: %d", (int)arrRHCalTable[i].ADcounts, (int)arrRHCalTable[i].RHpercent);
+        }
+    }
+}
+
+
+// Returns the RH% as an integer multiplied times ten.
+// Assumes the RH percent values in the table are stored as integers multiplied times 100.
+// So the final value extrapolated below from this lookup table is divided by 10 to yield the RH times ten.
+unsigned short CalculateRH_X10(short numSetpoints, short ADcounts, TableType *ptrTable)
+{    
+    short i;
+    long AD1, AD2;
+    long RHcalculated = 0;
+    unsigned short RHint;
+    long RH1, RH2, slopeNumerator, slopeDenominator;
+      
+    if (numSetpoints < 2) return (0);
+    for (i = 0; i < numSetpoints; i++)
+    {
+        if (ADcounts <= ptrTable[i].ADcounts)
+            break;
+    }
+    if (i >= numSetpoints) i = numSetpoints - 1;
+    if (ADcounts == ptrTable[i].ADcounts)
+    {
+        RHcalculated = ptrTable[i].RHpercent;  // $$$$
+        RHcalculated = RHcalculated / 10;
+        return(RHcalculated);    
+    }
+    if (i==0) i = 1;
+    RH1 = (long) ptrTable[i-1].RHpercent;
+    RH2 = (long) ptrTable[i].RHpercent;
+    AD1 = (long) ptrTable[i-1].ADcounts;
+    AD2 = (long) ptrTable[i].ADcounts;
+    if (AD2 == AD1) return 0;
+    
+    slopeNumerator = RH2 - RH1;
+    slopeDenominator = AD2 - AD1;
+    
+    RHcalculated = (ADcounts - AD1) * slopeNumerator;
+    RHcalculated = RHcalculated / slopeDenominator;
+    RHcalculated = RHcalculated + RH1;
+    RHcalculated = RHcalculated / 10;
+    if (RHcalculated < 0) RHcalculated = 0;
+    RHint = (unsigned short) RHcalculated;
+    return RHint;
+}
+
+
+
+/*
+unsigned char eeprom_read(unsigned char  address)
+{
+    EEADR=address; // load address of EEPROM to read
+    EECON1bits.EEPGD=0; // access EEPROM data memory
+    EECON1bits.CFGS=0; // do not access configuration registers
+    EECON1bits.RD=1; // initiate read
+    return EEDATA; // return EEPROM byte
+}
+
+// Write Byte to internal EEPROM
+unsigned char  eeprom_write(unsigned char  address, unsigned char  data)
+{
+    EECON1bits.WREN=1; // allow EEPROM writes
+    EEADR=address; // load address of write to EEPROM
+    EEDATA=data; // load data to write to EEPROM
+    EECON1bits.EEPGD=0;// access EEPROM data memory
+    EECON1bits.CFGS=0; // do not access configuration registers
+    INTCONbits.GIE=0; // disable interrupts for critical EEPROM write sequence
+    //===============//
+    EECON2=0x55;
+    EECON2=0xAA;
+    EECON1bits.WR=1;
+    //==============//
+    INTCONbits.GIE=1; // enable interrupts, critical sequence complete
+    while (EECON1bits.WR==1); // wait for write to complete
+    EECON1bits.WREN=0; // do not allow EEPROM writes
+
+    //Verify write operation
+    if (eeprom_read(address)==data) // read the byte we just wrote to EEPROM
+    return true; // write was successful
+    else
+    return false; // write failed
+}
+ */
+
+/*
+unsigned short CalculateTimerReload(short pulseIndex)
+{
+    float DiffCounts, PulseCounts, fTimerReload;
+    float QuadSineCounts, PulseDegrees, previousDegrees, DiffDegrees;
+    long lngReload;
+    
+    if (SineFrequency==0) return 0;    
+    
+    if (pulseIndex < (NUMBER_OF_PULSES_PER_QUADRANT*2)) PulseDegrees = QuadSineTable[pulseIndex];
+    else PulseDegrees = 90;
+    
+    if (pulseIndex > 0) previousDegrees = QuadSineTable[pulseIndex-1];
+    else previousDegrees = 0;     
+    
+    DiffDegrees = PulseDegrees - previousDegrees;
+    
+    QuadSineCounts = (float) ((SYSTEM_CLOCK/(4 * SineFrequency)) / 4);
+            
+    DiffCounts = (long)(QuadSineCounts * DiffDegrees);
+    
+    PulseCounts = DiffCounts / 90;
+    
+    // if (PulseCounts < 0) PulseCounts = 0;
+    fTimerReload = 65536.0 - PulseCounts;
+    // if (TimerReload < 0) TimerReload = 0;        
+    
+    lngReload = (long) fTimerReload;
+    
+    
+    printf("\r#%d: Pre: %0.4f, Puls: %0.4f, Diff: %0.4f, PCount: %0.0f, Re: %0.0f", pulseIndex, previousDegrees, PulseDegrees, DiffDegrees, PulseCounts, fTimerReload);
+    // printf("\r#%d: Diff: %0.4f, PCount: %0.0f, Re: %0.0f, LNG: %d", pulseIndex, DiffDegrees, PulseCounts, fTimerReload, (int)lngReload);
+    // printf("\r%0.0f,", fTimerReload);
+    
+    return (unsigned short) lngReload;
+}
+*/
+
+unsigned short ADconvertAndRead(unsigned char channel)
+{
+    unsigned short highByte;
+    short ADresult;
+    
+    ADCON0 = (channel << 2) | 0x03; // Set AD channel. Use +5V & GND for reference.
+    ADCON0bits.ADON = 1; // Turn on converter    
+    ADCON0bits.GO_DONE = 1;
+    
+    while (ADCON0bits.GO_DONE); // Wait for conversion to complete
+    highByte = (unsigned short) ADRESH;
+    highByte = (highByte << 8) & 0x0F00;  // Allow 12 bit AD!!!!
+    ADresult = (short) (highByte | ADRESL);
+    return (ADresult);
+}
+
+
+void StartADconversion(unsigned char channel)
+{
+    // while (ADCON0bits.GO_DONE); // If a conversion is running, wait for it to complete (shouldn't happen, but just in case)
+    ADCON0 = (channel << 2) | 0x03; // Set AD channel. Use +5V & GND for reference.
+    ADCON0bits.ADON = 1; // Turn on converter    
+    ADCON0bits.GO_DONE = 1;    
+}
+
+unsigned short GetADconversion()
+{
+    unsigned short highByte;
+    unsigned short ADresult;
+    
+    highByte = (unsigned short) ADRESH;
+    highByte = (highByte << 8) & 0x0F00;  // Allow 12 bit AD!!!!
+    ADresult = (short) (highByte | ADRESL);
+    return (ADresult);
+}
+
+
